@@ -48,25 +48,26 @@
         <button id="cancle">CANCLE</button>
     </div>
 
-    <script id="karnel" type="text/plain">
-precision highp float;
-in vec2 uv;
+    <script id="karnel" type="text/plain">precision highp float;
 float kernal(vec3 ver) {
-vec3 a;
+vec3 a = ver;
 float b, c, d, e;
-a = ver;
 for (int i = 0; i < 5; i++) {
 b = length(a);
 c = atan(a.y, a.x) * 8.0;
-e = 1.0 / b;
-d = acos(a.z / b) * 8.0;
+e = 1.0 / max(b, 0.0001); // Evita divisiones por cero
+d = acos(clamp(a.z / b, -1.0, 1.0)) * 8.0; // Asegura valores válidos en acos
 b = pow(b, 8.0);
-a = vec3(b * sin(d) * cos(c), b * sin(d) * sin(c), b * cos(d)) + ver;
+a = vec3(
+b * sin(d) * cos(c),
+b * sin(d) * sin(c),
+b * cos(d)
+) + ver;
 if (b > 6.0) {
 break;
 }
 }
-return 4.0 - a.x * a.x - a.y * a.y - a.z * a.z;
+return 4.0 - dot(a, a);
 }
 </script>
 
@@ -150,13 +151,15 @@ fragColor = vec4(color, 1.0);
 </script>
 
 <script id="vshare" type="text/plain">#version 300 es
-in vec3 position;
-out vec3 dir;
-out vec3 localdir;
-out vec2 uv;
+precision highp float;
+in vec4 position;
+out vec3 dir, localdir;
+uniform vec3 right, forward, up, origin;
+uniform float x, y;
 void main() {
-dir = position * 0.5 + 0.5;
-gl_Position = vec4(position, 1.0);
+gl_Position = position;
+dir = forward + right * position.x * x + up * position.y * y;
+localdir = vec3(position.x * x, position.y * y, -1.0);
 }
 </script>
 
