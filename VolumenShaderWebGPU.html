@@ -32,6 +32,21 @@
             top: 30px;
             display: none;
         }
+
+        #hud {
+            position: fixed;
+            right: 8px;
+            top: 8px;
+            padding: 6px 8px;
+            background: rgba(0, 0, 0, 0.58);
+            color: #d9f7e6;
+            border: 1px solid rgba(180, 255, 220, 0.28);
+            border-radius: 6px;
+            font: 12px/1.2 Consolas, Monaco, monospace;
+            white-space: pre;
+            pointer-events: none;
+            user-select: none;
+        }
     </style>
 </head>
 <body style="overflow-x:hidden;overflow-y:hidden">
@@ -47,6 +62,8 @@
         <button id="cancle">CANCLE</button>
     </div>
 
+    <div id="hud">FPS: --\nMS: --\nScale: --</div>
+
     <script id="kernelSource" type="text/plain">fn kernal(ver: vec3<f32>) -> f32 {
     var a = ver;
     var b: f32 = 0.0;
@@ -58,12 +75,18 @@
         c = atan2(a.y, a.x) * 8.0;
         let safeB = max(b, 0.0001);
         d = acos(clamp(a.z / safeB, -1.0, 1.0)) * 8.0;
-        b = pow(b, 8.0);
+        let sd = sin(d);
+        let cd = cos(d);
+        let sc = sin(c);
+        let cc = cos(c);
+        let b2 = b * b;
+        let b4 = b2 * b2;
+        b = b4 * b4;
 
         a = vec3<f32>(
-            b * sin(d) * cos(c),
-            b * sin(d) * sin(c),
-            b * cos(d)
+            b * sd * cc,
+            b * sd * sc,
+            b * cd
         ) + ver;
 
         if (b > 6.0) {
@@ -105,7 +128,51 @@
         let uniformBuffer;
         let bindGroup;
         let frameTime = 0.0;
+        let dynamicResScale = 1.0;
+        let lastFrameNow = 0.0;
+        let avgFrameMs = 16.7;
+        let frameAdjustCounter = 0;
+        let hudElement;
+        let lastHudUpdate = 0.0;
+        let qualityAdjustCounter = 0;
+        let qualityChangeCooldown = 0.0;
+        let pipelineRebuildPending = false;
         const DEBUG_SOLID_COLOR = false;
+        const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+        const PERF_PROFILE = IS_IOS
+            ? {
+                stepSize: 0.0026,
+                solver: 6,
+                maxSteps: 640,
+                fastNormal: 1,
+                maxDpr: 1.25,
+                resScale: 0.88
+            }
+            : {
+                stepSize: 0.002,
+                solver: 8,
+                maxSteps: 1000,
+                fastNormal: 0,
+                maxDpr: 2.0,
+                resScale: 1.0
+            };
+
+        const IOS_SHADER_QUALITY = [
+            { name: "L", stepSize: 0.0034, solver: 4, maxSteps: 420, fastNormal: 1 },
+            { name: "M", stepSize: 0.0030, solver: 5, maxSteps: 520, fastNormal: 1 },
+            { name: "H", stepSize: PERF_PROFILE.stepSize, solver: PERF_PROFILE.solver, maxSteps: PERF_PROFILE.maxSteps, fastNormal: PERF_PROFILE.fastNormal }
+        ];
+        let shaderQualityIndex = IS_IOS ? 2 : 0;
+        let activeShaderProfile = IS_IOS
+            ? { ...IOS_SHADER_QUALITY[shaderQualityIndex] }
+            : {
+                name: "H",
+                stepSize: PERF_PROFILE.stepSize,
+                solver: PERF_PROFILE.solver,
+                maxSteps: PERF_PROFILE.maxSteps,
+                fastNormal: PERF_PROFILE.fastNormal
+            };
 
         function fitMain() {
             const size = Math.max(1, Math.min(window.innerWidth, window.innerHeight));
@@ -114,6 +181,63 @@
             const c = document.getElementById("c1");
             c.style.width = size + "px";
             c.style.height = size + "px";
+
+            if (c && device) {
+                const dpr = Math.min(window.devicePixelRatio || 1, PERF_PROFILE.maxDpr);
+                const internal = Math.max(256, Math.floor(size * dpr * PERF_PROFILE.resScale * dynamicResScale));
+                if (c.width !== internal || c.height !== internal) {
+                    c.width = internal;
+                    c.height = internal;
+                }
+            }
+        }
+
+        function updateHud(now) {
+            if (!hudElement) {
+                return;
+            }
+            if (now - lastHudUpdate < 250.0) {
+                return;
+            }
+
+            const fps = 1000.0 / Math.max(1.0, avgFrameMs);
+            const internalScale = PERF_PROFILE.resScale * dynamicResScale;
+            hudElement.textContent =
+                "FPS: " + fps.toFixed(1) + "\n" +
+                "MS: " + avgFrameMs.toFixed(2) + "\n" +
+                "Scale: " + internalScale.toFixed(2) + "\n" +
+                "Q: " + activeShaderProfile.name + (IS_IOS ? " iOS" : "");
+            lastHudUpdate = now;
+        }
+
+        async function requestShaderQuality(index) {
+            if (!IS_IOS) {
+                return;
+            }
+            if (index < 0 || index >= IOS_SHADER_QUALITY.length) {
+                return;
+            }
+            if (index === shaderQualityIndex || pipelineRebuildPending) {
+                return;
+            }
+
+            pipelineRebuildPending = true;
+            const prevIndex = shaderQualityIndex;
+            const prevProfile = activeShaderProfile;
+            const nextProfile = IOS_SHADER_QUALITY[index];
+
+            shaderQualityIndex = index;
+            activeShaderProfile = { ...nextProfile };
+
+            try {
+                await createPipelineWithKernel(KERNEL);
+            } catch (err) {
+                shaderQualityIndex = prevIndex;
+                activeShaderProfile = prevProfile;
+                console.error("Shader quality switch failed:", err);
+            } finally {
+                pipelineRebuildPending = false;
+            }
         }
 
         function buildShaderSource(kernelCode) {
@@ -165,8 +289,11 @@ fn vsMain(@builtin(vertex_index) vid: u32) -> VSOut {
 
 ${kernelCode}
 
-const SOLVER: i32 = 8;
-const STEP_SIZE: f32 = 0.002;
+const SOLVER: i32 = ${activeShaderProfile.solver};
+const STEP_SIZE: f32 = ${activeShaderProfile.stepSize};
+const MAX_STEPS: i32 = ${activeShaderProfile.maxSteps};
+const FAST_NORMAL: i32 = ${activeShaderProfile.fastNormal};
+const BOUND_RADIUS: f32 = 2.8;
 
 @fragment
 fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
@@ -180,29 +307,51 @@ fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
     );
     var sign: i32 = 0;
 
+    let distStep = STEP_SIZE * camera.len;
+    let dirStep = d * distStep;
+    let maxDistance = 2.0 * camera.len;
+
+    // Skip rays that cannot reach the fractal volume and start marching near entry.
+    let oc = camera.origin;
+    let bRay = dot(oc, d);
+    let cRay = dot(oc, oc) - BOUND_RADIUS * BOUND_RADIUS;
+    let h = bRay * bRay - cRay;
+    if (h <= 0.0) {
+        return vec4<f32>(color, 1.0);
+    }
+    let sqrtH = sqrt(h);
+    let tEnter = max(0.0, -bRay - sqrtH);
+    let tExit = -bRay + sqrtH;
+    if (tExit <= 0.0) {
+        return vec4<f32>(color, 1.0);
+    }
+    let marchEnd = min(maxDistance, tExit);
+
     var v: f32 = 0.0;
-    var v1: f32 = kernal(camera.origin + dir * (STEP_SIZE * camera.len));
-    var v2: f32 = kernal(camera.origin);
+    var marchDist: f32 = max(distStep, tEnter + distStep);
+    var ver = camera.origin + d * marchDist;
+    var v1: f32 = kernal(ver - dirStep);
 
     var r1: f32 = 0.0;
     var r2: f32 = 0.0;
     var r3: f32 = 0.0;
     var r4: f32 = 0.0;
 
-    var ver = vec3<f32>(0.0, 0.0, 0.0);
     var m3: f32 = 0.0;
 
-    for (var k: i32 = 2; k < 1002; k = k + 1) {
-        ver = camera.origin + dir * (STEP_SIZE * camera.len * f32(k));
+    for (var k: i32 = 2; k < MAX_STEPS; k = k + 1) {
+        if (marchDist > marchEnd) {
+            break;
+        }
         v = kernal(ver);
 
         if (v > 0.0 && v1 < 0.0) {
-            r1 = STEP_SIZE * camera.len * f32(k - 1);
-            r2 = STEP_SIZE * camera.len * f32(k);
+            r1 = marchDist - distStep;
+            r2 = marchDist;
 
             for (var l: i32 = 0; l < SOLVER; l = l + 1) {
                 r3 = (r1 + r2) * 0.5;
-                m3 = kernal(camera.origin + dir * r3);
+                m3 = kernal(camera.origin + d * r3);
 
                 if (m3 > 0.0) {
                     r2 = r3;
@@ -217,19 +366,33 @@ fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
             }
         }
 
-        v2 = v1;
         v1 = v;
+        ver = ver + dirStep;
+        marchDist = marchDist + distStep;
     }
 
     if (sign == 1) {
-        ver = camera.origin + dir * r3;
+        ver = camera.origin + d * r3;
         r1 = dot(ver, ver);
 
-        let eps = max(0.00001, r3 * 0.00025);
+        let eps = max(0.00002, r3 * 0.00030);
         var n = vec3<f32>(0.0, 0.0, 0.0);
-        n.x = kernal(ver - camera.right * eps) - kernal(ver + camera.right * eps);
-        n.y = kernal(ver - camera.up * eps) - kernal(ver + camera.up * eps);
-        n.z = kernal(ver + camera.forward * eps) - kernal(ver - camera.forward * eps);
+
+        if (FAST_NORMAL == 1) {
+            let e1 = camera.right + camera.up + camera.forward;
+            let e2 = camera.right - camera.up - camera.forward;
+            let e3 = -camera.right + camera.up - camera.forward;
+            let e4 = -camera.right - camera.up + camera.forward;
+            n =
+                e1 * kernal(ver + e1 * eps) +
+                e2 * kernal(ver + e2 * eps) +
+                e3 * kernal(ver + e3 * eps) +
+                e4 * kernal(ver + e4 * eps);
+        } else {
+            n.x = kernal(ver - camera.right * eps) - kernal(ver + camera.right * eps);
+            n.y = kernal(ver - camera.up * eps) - kernal(ver + camera.up * eps);
+            n.z = kernal(ver + camera.forward * eps) - kernal(ver - camera.forward * eps);
+        }
         let nLen = length(n);
         if (nLen > 0.000001) {
             n = n / nLen;
@@ -237,7 +400,7 @@ fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
             n = -d;
         }
 
-        let reflectionVec = reflect(normalize(dir), n);
+        let reflectionVec = reflect(d, n);
         r3 = dot(reflectionVec, vec3<f32>(0.276, 0.920, 0.276));
         r4 = dot(n, vec3<f32>(0.276, 0.920, 0.276));
 
@@ -370,9 +533,53 @@ fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
             device.queue.submit([encoder.finish()]);
         }
 
-        function ontimer() {
+        function ontimer(now) {
+            if (document.hidden) {
+                lastFrameNow = now;
+                window.requestAnimationFrame(ontimer);
+                return;
+            }
+
+            if (lastFrameNow > 0.0) {
+                const dt = Math.max(1.0, now - lastFrameNow);
+                avgFrameMs = avgFrameMs * 0.9 + dt * 0.1;
+                frameTime += dt * 0.001;
+
+                if (IS_IOS) {
+                    frameAdjustCounter += 1;
+                    if (frameAdjustCounter >= 20) {
+                        let changed = false;
+                        if (avgFrameMs > 22.0 && dynamicResScale > 0.72) {
+                            dynamicResScale = Math.max(0.72, dynamicResScale - 0.06);
+                            changed = true;
+                        } else if (avgFrameMs < 17.0 && dynamicResScale < 1.0) {
+                            dynamicResScale = Math.min(1.0, dynamicResScale + 0.04);
+                            changed = true;
+                        }
+
+                        if (changed) {
+                            fitMain();
+                        }
+                        frameAdjustCounter = 0;
+                    }
+
+                    qualityAdjustCounter += 1;
+                    if (qualityAdjustCounter >= 30 && now >= qualityChangeCooldown) {
+                        if (avgFrameMs > 24.5 && shaderQualityIndex > 0) {
+                            requestShaderQuality(shaderQualityIndex - 1);
+                            qualityChangeCooldown = now + 4000.0;
+                        } else if (avgFrameMs < 16.0 && shaderQualityIndex < IOS_SHADER_QUALITY.length - 1) {
+                            requestShaderQuality(shaderQualityIndex + 1);
+                            qualityChangeCooldown = now + 6000.0;
+                        }
+                        qualityAdjustCounter = 0;
+                    }
+                }
+            }
+            lastFrameNow = now;
+            updateHud(now);
+
             ang1 += 0.01;
-            frameTime += 1.0 / 60.0;
             draw();
             window.requestAnimationFrame(ontimer);
         }
@@ -584,9 +791,7 @@ fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
                 format: format,
                 alphaMode: "opaque"
             });
-
-            canvas.width = 1024;
-            canvas.height = 1024;
+            fitMain();
 
             uniformBuffer = device.createBuffer({
                 size: 80,
@@ -602,6 +807,7 @@ fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
 
         window.onload = async function () {
             fitMain();
+            hudElement = document.getElementById("hud");
             setupInputHandlers();
             setupConfigHandlers();
 
