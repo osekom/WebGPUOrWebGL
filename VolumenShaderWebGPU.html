@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="user-scalable=no" />
+    <title>volumeshader_webgpu</title>
+    <style>
+        body {
+            background: #131115;
+            margin: 0;
+        }
+
+        #c1 {
+            background: #fbf7fe;
+        }
+
+        #btn {
+            position: fixed;
+            left: 0px;
+            top: 0px;
+        }
+
+        #c1 {
+            position: fixed;
+            left: 0px;
+            top: 0px;
+        }
+
+        #config {
+            position: fixed;
+            left: 0px;
+            top: 30px;
+            display: none;
+        }
+    </style>
+</head>
+<body style="overflow-x:hidden;overflow-y:hidden">
+    <canvas id="c1" width="1024" height="1024">
+        <span>Your browser does not support canvas</span>
+    </canvas>
+
+    <button id="btn">CONFIG</button>
+    <div id="config">
+        <textarea id="kernel" cols="30" rows="10"></textarea>
+        <br />
+        <button id="apply">APPLY</button>
+        <button id="cancle">CANCLE</button>
+    </div>
+
+    <script id="kernelSource" type="text/plain">fn kernal(ver: vec3<f32>) -> f32 {
+    var a = ver;
+    var b: f32 = 0.0;
+    var c: f32 = 0.0;
+    var d: f32 = 0.0;
+
+    for (var i: i32 = 0; i < 5; i = i + 1) {
+        b = length(a);
+        c = atan2(a.y, a.x) * 8.0;
+        let safeB = max(b, 0.0001);
+        d = acos(clamp(a.z / safeB, -1.0, 1.0)) * 8.0;
+        b = pow(b, 8.0);
+
+        a = vec3<f32>(
+            b * sin(d) * cos(c),
+            b * sin(d) * sin(c),
+            b * cos(d)
+        ) + ver;
+
+        if (b > 6.0) {
+            break;
+        }
+    }
+
+    return 4.0 - dot(a, a);
+}
+</script>
+
+    <script>
+        let cx = 0;
+        let cy = 0;
+        let mx = 0;
+        let my = 0;
+        let mx1 = 0;
+        let my1 = 0;
+        let lasttimen = 0;
+        let ml = 0;
+        let mr = 0;
+        let mm = 0;
+
+        let len = 1.6;
+        let ang1 = 2.8;
+        let ang2 = 0.4;
+        let cenx = 0.0;
+        let ceny = 0.0;
+        let cenz = 0.0;
+
+        let KERNEL = document.getElementById("kernelSource").textContent;
+
+        let canvas;
+        let adapter;
+        let device;
+        let context;
+        let format;
+        let pipeline;
+        let uniformBuffer;
+        let bindGroup;
+        let frameTime = 0.0;
+        const DEBUG_SOLID_COLOR = false;
+
+        function fitMain() {
+            const size = Math.max(1, Math.min(window.innerWidth, window.innerHeight));
+            cx = size;
+            cy = size;
+            const c = document.getElementById("c1");
+            c.style.width = size + "px";
+            c.style.height = size + "px";
+        }
+
+        function buildShaderSource(kernelCode) {
+            const debugSnippet = DEBUG_SOLID_COLOR
+                ? "return vec4<f32>(0.0, 0.9, 0.4, 1.0);"
+                : "";
+
+            return `
+struct Camera {
+    right: vec3<f32>,
+    _pad0: f32,
+    forward: vec3<f32>,
+    _pad1: f32,
+    up: vec3<f32>,
+    _pad2: f32,
+    origin: vec3<f32>,
+    _pad3: f32,
+    x: f32,
+    y: f32,
+    len: f32,
+    time: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+struct VSOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) dir: vec3<f32>,
+};
+
+@vertex
+fn vsMain(@builtin(vertex_index) vid: u32) -> VSOut {
+    var positions = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, 1.0)
+    );
+
+    let p = positions[vid];
+    var out: VSOut;
+    out.pos = vec4<f32>(p, 0.0, 1.0);
+    out.dir = camera.forward + camera.right * p.x * camera.x + camera.up * p.y * camera.y;
+    return out;
+}
+
+${kernelCode}
+
+const SOLVER: i32 = 8;
+const STEP_SIZE: f32 = 0.002;
+
+@fragment
+fn fsMain(@location(0) dir: vec3<f32>) -> @location(0) vec4<f32> {
+    ${debugSnippet}
+
+    let d = normalize(dir);
+    var color = vec3<f32>(
+        0.12 + 0.55 * max(0.0, d.y),
+        0.10 + 0.35 * max(0.0, d.y),
+        0.20 + 0.65 * max(0.0, -d.z)
+    );
+    var sign: i32 = 0;
+
+    var v: f32 = 0.0;
+    var v1: f32 = kernal(camera.origin + dir * (STEP_SIZE * camera.len));
+    var v2: f32 = kernal(camera.origin);
+
+    var r1: f32 = 0.0;
+    var r2: f32 = 0.0;
+    var r3: f32 = 0.0;
+    var r4: f32 = 0.0;
+
+    var ver = vec3<f32>(0.0, 0.0, 0.0);
+    var m3: f32 = 0.0;
+
+    for (var k: i32 = 2; k < 1002; k = k + 1) {
+        ver = camera.origin + dir * (STEP_SIZE * camera.len * f32(k));
+        v = kernal(ver);
+
+        if (v > 0.0 && v1 < 0.0) {
+            r1 = STEP_SIZE * camera.len * f32(k - 1);
+            r2 = STEP_SIZE * camera.len * f32(k);
+
+            for (var l: i32 = 0; l < SOLVER; l = l + 1) {
+                r3 = (r1 + r2) * 0.5;
+                m3 = kernal(camera.origin + dir * r3);
+
+                if (m3 > 0.0) {
+                    r2 = r3;
+                } else {
+                    r1 = r3;
+                }
+            }
+
+            if (r3 < 2.0 * camera.len) {
+                sign = 1;
+                break;
+            }
+        }
+
+        v2 = v1;
+        v1 = v;
+    }
+
+    if (sign == 1) {
+        ver = camera.origin + dir * r3;
+        r1 = dot(ver, ver);
+
+        let eps = max(0.00001, r3 * 0.00025);
+        var n = vec3<f32>(0.0, 0.0, 0.0);
+        n.x = kernal(ver - camera.right * eps) - kernal(ver + camera.right * eps);
+        n.y = kernal(ver - camera.up * eps) - kernal(ver + camera.up * eps);
+        n.z = kernal(ver + camera.forward * eps) - kernal(ver - camera.forward * eps);
+        let nLen = length(n);
+        if (nLen > 0.000001) {
+            n = n / nLen;
+        } else {
+            n = -d;
+        }
+
+        let reflectionVec = reflect(normalize(dir), n);
+        r3 = dot(reflectionVec, vec3<f32>(0.276, 0.920, 0.276));
+        r4 = dot(n, vec3<f32>(0.276, 0.920, 0.276));
+
+        r3 = max(0.0, r3);
+        r3 = pow(r3, 4.0) * 0.45 + r4 * 0.25 + 0.3;
+
+        color.r = sin(r1 * 10.0) * 0.5 + 0.5;
+        color.g = sin(r1 * 10.0 + 2.05) * 0.5 + 0.5;
+        color.b = sin(r1 * 10.0 - 2.05) * 0.5 + 0.5;
+        color = color * r3;
+    }
+
+    // Guard against NaN/Inf paths turning the frame black on some drivers.
+    if (!all(color == color)) {
+        color = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    return vec4<f32>(color, 1.0);
+}
+`;
+        }
+
+        async function createPipelineWithKernel(kernelCode) {
+            const shaderSource = buildShaderSource(kernelCode);
+            const module = device.createShaderModule({ code: shaderSource });
+
+            const info = await module.getCompilationInfo();
+            const errors = info.messages.filter(function (m) {
+                return m.type === "error";
+            });
+
+            if (errors.length > 0) {
+                const text = errors
+                    .map(function (e) {
+                        return "Line " + e.lineNum + ":" + e.linePos + " - " + e.message;
+                    })
+                    .join("\n");
+                throw new Error(text);
+            }
+
+            const nextPipeline = device.createRenderPipeline({
+                layout: "auto",
+                vertex: {
+                    module: module,
+                    entryPoint: "vsMain"
+                },
+                fragment: {
+                    module: module,
+                    entryPoint: "fsMain",
+                    targets: [{ format: format }]
+                },
+                primitive: {
+                    topology: "triangle-list"
+                }
+            });
+
+            const nextBindGroup = device.createBindGroup({
+                layout: nextPipeline.getBindGroupLayout(0),
+                entries: [
+                    {
+                        binding: 0,
+                        resource: {
+                            buffer: uniformBuffer
+                        }
+                    }
+                ]
+            });
+
+            pipeline = nextPipeline;
+            bindGroup = nextBindGroup;
+        }
+
+        function updateUniforms() {
+            const rightX = Math.sin(ang1);
+            const rightY = 0.0;
+            const rightZ = -Math.cos(ang1);
+
+            const upX = -Math.sin(ang2) * Math.cos(ang1);
+            const upY = Math.cos(ang2);
+            const upZ = -Math.sin(ang2) * Math.sin(ang1);
+
+            const forwardX = -Math.cos(ang1) * Math.cos(ang2);
+            const forwardY = -Math.sin(ang2);
+            const forwardZ = -Math.sin(ang1) * Math.cos(ang2);
+
+            const originX = len * Math.cos(ang1) * Math.cos(ang2) + cenx;
+            const originY = len * Math.sin(ang2) + ceny;
+            const originZ = len * Math.sin(ang1) * Math.cos(ang2) + cenz;
+
+            const x = cx * 2.0 / (cx + cy);
+            const y = cy * 2.0 / (cx + cy);
+
+            const data = new Float32Array(20);
+            data.set([rightX, rightY, rightZ, 0.0], 0);
+            data.set([forwardX, forwardY, forwardZ, 0.0], 4);
+            data.set([upX, upY, upZ, 0.0], 8);
+            data.set([originX, originY, originZ, 0.0], 12);
+            data.set([x, y, len, frameTime], 16);
+
+            device.queue.writeBuffer(uniformBuffer, 0, data.buffer, data.byteOffset, data.byteLength);
+        }
+
+        function draw() {
+            if (!pipeline) {
+                return;
+            }
+
+            updateUniforms();
+
+            const encoder = device.createCommandEncoder();
+            const view = context.getCurrentTexture().createView();
+
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [
+                    {
+                        view: view,
+                        clearValue: { r: 0.06, g: 0.06, b: 0.08, a: 1.0 },
+                        loadOp: "clear",
+                        storeOp: "store"
+                    }
+                ]
+            });
+
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.draw(6, 1, 0, 0);
+            pass.end();
+
+            device.queue.submit([encoder.finish()]);
+        }
+
+        function ontimer() {
+            ang1 += 0.01;
+            frameTime += 1.0 / 60.0;
+            draw();
+            window.requestAnimationFrame(ontimer);
+        }
+
+        function setupInputHandlers() {
+            document.addEventListener(
+                "mousedown",
+                function (ev) {
+                    if (ev.button === 0) {
+                        ml = 1;
+                        mm = 0;
+                    }
+                    if (ev.button === 2) {
+                        mr = 1;
+                        mm = 0;
+                    }
+                    mx = ev.clientX;
+                    my = ev.clientY;
+                },
+                false
+            );
+
+            document.addEventListener(
+                "mouseup",
+                function (ev) {
+                    if (ev.button === 0) {
+                        ml = 0;
+                    }
+                    if (ev.button === 2) {
+                        mr = 0;
+                    }
+                },
+                false
+            );
+
+            document.addEventListener(
+                "mousemove",
+                function (ev) {
+                    if (ml === 1) {
+                        ang1 += (ev.clientX - mx) * 0.002;
+                        ang2 += (ev.clientY - my) * 0.002;
+                        if (ev.clientX !== mx || ev.clientY !== my) {
+                            mm = 1;
+                        }
+                    }
+
+                    if (mr === 1) {
+                        const l = (len * 4.0) / (cx + cy);
+                        cenx += l * (-(ev.clientX - mx) * Math.sin(ang1) - (ev.clientY - my) * Math.sin(ang2) * Math.cos(ang1));
+                        ceny += l * ((ev.clientY - my) * Math.cos(ang2));
+                        cenz += l * ((ev.clientX - mx) * Math.cos(ang1) - (ev.clientY - my) * Math.sin(ang2) * Math.sin(ang1));
+                        if (ev.clientX !== mx || ev.clientY !== my) {
+                            mm = 1;
+                        }
+                    }
+
+                    mx = ev.clientX;
+                    my = ev.clientY;
+                },
+                false
+            );
+
+            document.addEventListener(
+                "wheel",
+                function (ev) {
+                    ev.preventDefault();
+                    len *= Math.exp(ev.deltaY * 0.001);
+                },
+                { passive: false }
+            );
+
+            document.addEventListener(
+                "touchstart",
+                function (ev) {
+                    const n = ev.touches.length;
+                    if (n === 1) {
+                        mx = ev.touches[0].clientX;
+                        my = ev.touches[0].clientY;
+                    } else if (n === 2) {
+                        mx = ev.touches[0].clientX;
+                        my = ev.touches[0].clientY;
+                        mx1 = ev.touches[1].clientX;
+                        my1 = ev.touches[1].clientY;
+                    }
+                    lasttimen = n;
+                },
+                false
+            );
+
+            document.addEventListener(
+                "touchend",
+                function (ev) {
+                    const n = ev.touches.length;
+                    if (n === 1) {
+                        mx = ev.touches[0].clientX;
+                        my = ev.touches[0].clientY;
+                    } else if (n === 2) {
+                        mx = ev.touches[0].clientX;
+                        my = ev.touches[0].clientY;
+                        mx1 = ev.touches[1].clientX;
+                        my1 = ev.touches[1].clientY;
+                    }
+                    lasttimen = n;
+                },
+                false
+            );
+
+            document.addEventListener(
+                "touchmove",
+                function (ev) {
+                    ev.preventDefault();
+                    const n = ev.touches.length;
+
+                    if (n === 1 && lasttimen === 1) {
+                        const oEvent = ev.touches[0];
+                        ang1 += (oEvent.clientX - mx) * 0.002;
+                        ang2 += (oEvent.clientY - my) * 0.002;
+                        mx = oEvent.clientX;
+                        my = oEvent.clientY;
+                    } else if (n === 2) {
+                        const t0 = ev.touches[0];
+                        const t1 = ev.touches[1];
+
+                        let l = (len * 2.0) / (cx + cy);
+                        cenx += l * (-(t0.clientX + t1.clientX - mx - mx1) * Math.sin(ang1) - (t0.clientY + t1.clientY - my - my1) * Math.sin(ang2) * Math.cos(ang1));
+                        ceny += l * ((t0.clientY + t1.clientY - my - my1) * Math.cos(ang2));
+                        cenz += l * ((t0.clientX + t1.clientX - mx - mx1) * Math.cos(ang1) - (t0.clientY + t1.clientY - my - my1) * Math.sin(ang2) * Math.sin(ang1));
+
+                        const l1 = Math.sqrt((mx - mx1) * (mx - mx1) + (my - my1) * (my - my1) + 1.0);
+
+                        mx = t0.clientX;
+                        my = t0.clientY;
+                        mx1 = t1.clientX;
+                        my1 = t1.clientY;
+
+                        l = Math.sqrt((mx - mx1) * (mx - mx1) + (my - my1) * (my - my1) + 1.0);
+                        len *= l1 / l;
+                    }
+
+                    lasttimen = n;
+                },
+                { passive: false }
+            );
+
+            document.oncontextmenu = function (event) {
+                if (mm === 1) {
+                    event.preventDefault();
+                }
+            };
+        }
+
+        function setupConfigHandlers() {
+            document.getElementById("kernel").value = KERNEL;
+
+            document.getElementById("btn").addEventListener("click", function () {
+                const state = this.innerText === "CONFIG";
+                this.innerText = state ? "HIDE" : "CONFIG";
+                document.getElementById("config").style.display = state ? "inline" : "none";
+            });
+
+            document.getElementById("apply").addEventListener("click", async function () {
+                const nextKernel = document.getElementById("kernel").value;
+                try {
+                    await createPipelineWithKernel(nextKernel);
+                    KERNEL = nextKernel;
+                } catch (err) {
+                    alert(String(err.message || err));
+                }
+            });
+
+            document.getElementById("cancle").addEventListener("click", function () {
+                document.getElementById("kernel").value = KERNEL;
+            });
+        }
+
+        async function initWebGPU() {
+            if (!navigator.gpu) {
+                const useFallback = confirm(
+                    "WebGPU API is not available in this Safari session.\n\nOpen the WebGL2 version instead?"
+                );
+                if (useFallback) {
+                    window.location.href = "./VolumenShaderWebGL2.html";
+                }
+                return;
+            }
+
+            canvas = document.getElementById("c1");
+            context = canvas.getContext("webgpu");
+            if (!context) {
+                alert("Could not get a WebGPU context.");
+                return;
+            }
+
+            adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                alert("No suitable GPU adapter was found.");
+                return;
+            }
+
+            device = await adapter.requestDevice();
+            device.addEventListener("uncapturederror", function (event) {
+                console.error("WebGPU uncaptured error:", event.error);
+                alert("WebGPU runtime error: " + event.error.message);
+            });
+            format = navigator.gpu.getPreferredCanvasFormat();
+
+            context.configure({
+                device: device,
+                format: format,
+                alphaMode: "opaque"
+            });
+
+            canvas.width = 1024;
+            canvas.height = 1024;
+
+            uniformBuffer = device.createBuffer({
+                size: 80,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+
+            await createPipelineWithKernel(KERNEL);
+        }
+
+        window.onresize = function () {
+            fitMain();
+        };
+
+        window.onload = async function () {
+            fitMain();
+            setupInputHandlers();
+            setupConfigHandlers();
+
+            try {
+                await initWebGPU();
+                draw();
+                window.requestAnimationFrame(ontimer);
+            } catch (err) {
+                console.error(err);
+                alert("WebGPU init error: " + String(err.message || err));
+            }
+        };
+    </script>
+</body>
+</html>
